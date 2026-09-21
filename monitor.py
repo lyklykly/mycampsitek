@@ -4,7 +4,7 @@
 
 하는 일
 1) 이번 달 + 다음 달 예약 달력을 브라우저처럼 열어본다.
-2) 달력의 맨 오른쪽 칸(토요일)만 읽는다.
+2) 달력의 맨 오른쪽 칸(토요일) + 내가 지정한 날짜(TARGET_DATES) 칸을 읽는다.
 3) '예약완료'가 아니라 숫자가 보이면 = 예약 가능 → 텔레그램으로 알려준다.
 4) 사이트가 접근을 막으면(403/429 등) 조회를 멈추고, 멈췄다고 알려준다.
 """
@@ -31,6 +31,7 @@ HEARTBEAT_DAYS = 30        # 30일마다 "아직 잘 돌고 있어요" 알림
 STATE_FILE = "state.json"
 DEBUG_DIR = "debug"
 KST = ZoneInfo("Asia/Seoul")
+WEEKDAYS = "월화수목금토일"
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 # ======================================================================
@@ -51,18 +52,17 @@ JS_READY = """
 }
 """
 
-JS_SATURDAY_CELLS = """
+JS_CALENDAR_CELLS = """
 () => {
   for (const t of document.querySelectorAll('table')) {
     const rows = Array.from(t.rows);
     if (!rows.length) continue;
     const head = Array.from(rows[0].cells).map(c => c.innerText.trim());
     if (head.length === 7 && head[0].startsWith('일') && head[6].startsWith('토')) {
-      return rows.slice(1).map(r => {
-        const cells = r.cells;
-        const c = cells[cells.length - 1];
-        return { n: cells.length, text: c ? c.innerText : '' };
-      });
+      return rows.slice(1).map(r => ({
+        n: r.cells.length,
+        cells: Array.from(r.cells).map(c => c.innerText || '')
+      }));
     }
   }
   return null;
@@ -144,45 +144,79 @@ def stop_monitoring(state, reason):
     send_telegram(msg)
 
 
-def months_to_check(today):
+def read_target_dates(today):
+    """GitHub 변수 TARGET_DATES (예: 2026-09-24,2026-10-04) → (앞으로 남은 날짜들, 잘못 적은 글자들)"""
+    raw = os.environ.get("TARGET_DATES", "")
+    good, bad = set(), []
+    for part in re.split(r"[,\s]+", raw.strip()):
+        if not part:
+            continue
+        try:
+            d = dt.date.fromisoformat(part)
+        except ValueError:
+            bad.append(part)
+            continue
+        if d >= today:
+            good.add(d)
+    return good, bad
+
+
+def months_to_check(today, targets):
     y, m = today.year, today.month
-    out = []
+    out = set()
     for _ in range(MONTHS_TO_CHECK):
-        out.append((y, m))
+        out.add((y, m))
         m += 1
         if m == 13:
             y, m = y + 1, 1
-    return out
+    for d in targets:
+        out.add((d.year, d.month))
+    return sorted(out)
 
 
 def month_url(y, m):
     return BASE_URL.format(yyyymm=f"{y}{m:02d}")
 
 
-def interpret(rows, y, m, today):
+def classify(text):
+    if any(w in text for w in FULL_WORDS):
+        return "full"
+    if re.search(r"\d", text):
+        return "available"
+    return "unknown"
+
+
+def interpret(rows, y, m, today, targets):
     """
-    달력 각 줄의 토요일 칸 글자 → [{day, status, text}] 로 바꾼다.
-    - 줄 순서로 날짜를 계산한다(일요일 시작 달력 기준, 맨 끝 칸 = 토요일).
+    달력 칸 글자 → [{date, status, text, target}] 로 바꾼다.
+    - 줄/칸 위치로 날짜를 계산한다(일요일 시작 달력: 칸 0=일 … 칸 6=토).
+    - 토요일 칸 전부 + 지정 날짜 칸만 고른다.
     - status: available(예약가능) / full(예약완료) / unknown(숫자도 완료도 아님)
     """
     weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(y, m)
     week_rows = [r for r in rows if r.get("n") == 7]
     result = []
     for i, r in enumerate(week_rows):
-        day = weeks[i][6] if i < len(weeks) else 0
-        if day == 0:
-            continue                          # 다음 달 날짜 칸
-        if dt.date(y, m, day) < today:
-            continue                          # 이미 지난 토요일
-        text = " ".join((r.get("text") or "").split())
-        if any(w in text for w in FULL_WORDS):
-            status = "full"
-        elif re.search(r"\d", text):
-            status = "available"
-        else:
-            status = "unknown"
-        result.append({"day": day, "status": status, "text": text})
+        if i >= len(weeks):
+            break
+        for col in range(7):
+            day = weeks[i][col]
+            if day == 0:
+                continue                      # 앞/뒤 달 날짜 칸
+            date = dt.date(y, m, day)
+            if date < today:
+                continue                      # 이미 지난 날
+            is_target = date in targets
+            if col != 6 and not is_target:
+                continue                      # 토요일도, 지정 날짜도 아님
+            text = " ".join((r["cells"][col] or "").split())
+            result.append({"date": date, "status": classify(text),
+                           "text": text, "target": is_target})
     return result
+
+
+def date_name(d):
+    return f"{d.year}년 {d.month}월 {d.day}일({WEEKDAYS[d.weekday()]})"
 
 
 def save_debug(page, name):
@@ -196,7 +230,7 @@ def save_debug(page, name):
 
 
 # ---------------------------- 달력 한 달 확인 ----------------------------
-def check_month(page, blocked_hits, y, m, today, keep_screenshot=False):
+def check_month(page, blocked_hits, y, m, today, targets, keep_screenshot=False):
     url = month_url(y, m)
     label = f"{y}.{m:02d}"
     print(f"[확인] {label} → {url}")
@@ -218,7 +252,7 @@ def check_month(page, blocked_hits, y, m, today, keep_screenshot=False):
     if any(w in body.lower() for w in BLOCK_TEXTS):
         raise Blocked("페이지에 '접근 차단/요청 제한' 문구가 보여요")
 
-    rows = page.evaluate(JS_SATURDAY_CELLS)
+    rows = page.evaluate(JS_CALENDAR_CELLS)
     if not rows or not any(r.get("n") == 7 for r in rows):
         raise RuntimeError(f"{label} 달력 표를 찾지 못했어요 (사이트 모양이 바뀌었을 수 있음)")
     if label not in body:
@@ -226,7 +260,7 @@ def check_month(page, blocked_hits, y, m, today, keep_screenshot=False):
 
     if keep_screenshot:
         save_debug(page, f"calendar_{y}{m:02d}")
-    return interpret(rows, y, m, today)
+    return interpret(rows, y, m, today, targets)
 
 
 # ---------------------------- 메인 ----------------------------
@@ -235,6 +269,8 @@ def main():
     manual = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
     now = dt.datetime.now(KST)
     today = now.date()
+    targets, bad_dates = read_target_dates(today)
+    print("지정 날짜:", sorted(d.isoformat() for d in targets) or "없음")
 
     state = load_state()
     first_run = not state
@@ -261,8 +297,8 @@ def main():
             page.on("response", lambda r: blocked_hits.append((r.status, r.url))
                     if "syf.or.kr" in r.url and r.status in BLOCK_STATUS else None)
             try:
-                for y, m in months_to_check(today):
-                    results[(y, m)] = check_month(page, blocked_hits, y, m, today,
+                for y, m in months_to_check(today, targets):
+                    results[(y, m)] = check_month(page, blocked_hits, y, m, today, targets,
                                                   keep_screenshot=test_mode)
                     page.wait_for_timeout(2000)   # 사이트에 부담 주지 않게 잠깐 쉬기
             except Exception:
@@ -289,14 +325,26 @@ def main():
     state["fail_count"] = 0
 
     if test_mode:
-        lines = ["🧪 테스트 결과 (지금 보이는 토요일 칸)"]
+        lines = ["🧪 테스트 결과 (토요일 + 📌지정 날짜)"]
         names = {"available": "✅ 예약가능", "full": "❌ 예약완료", "unknown": "❓ 판단불가"}
+        found = set()
         for (y, m), cells in results.items():
             lines.append(f"\n[{y}년 {m}월] {month_url(y, m)}")
             if not cells:
-                lines.append("  (남은 토요일 없음)")
+                lines.append("  (남은 날짜 없음)")
             for c in cells:
-                lines.append(f"  {c['day']}일(토): {names[c['status']]}  / 칸 글자: '{c['text']}'")
+                found.add(c["date"])
+                pin = "📌" if c["target"] else ""
+                d = c["date"]
+                lines.append(f"  {pin}{d.day}일({WEEKDAYS[d.weekday()]}): "
+                             f"{names[c['status']]}  / 칸 글자: '{c['text']}'")
+        lines.append("\n📌 지정 날짜: " + (", ".join(date_name(d) for d in sorted(targets)) or "없음"))
+        missing = sorted(targets - found)
+        if missing:
+            lines.append("⚠️ 달력에서 못 찾은 지정 날짜: " + ", ".join(date_name(d) for d in missing))
+        if bad_dates:
+            lines.append("⚠️ 날짜 모양이 잘못된 것(무시함): " + ", ".join(bad_dates)
+                         + "  → 2026-09-24 처럼 적어주세요")
         send_telegram("\n".join(lines))
         save_state(state)
         return
@@ -306,21 +354,23 @@ def main():
     for (y, m), cells in results.items():
         for c in cells:
             if c["status"] == "available":
-                key = f"{y}-{m:02d}-{c['day']:02d}"
+                key = c["date"].isoformat()
                 available_now.append(key)
-                details[key] = (y, m, c)
+                details[key] = c
 
     new_keys = [k for k in available_now if k not in state["notified"]]
     if new_keys:
-        lines = ["🏕️ 캠핑장 토요일 빈자리가 떴어요!\n"]
+        lines = ["🏕️ 캠핑장 빈자리가 떴어요!\n"]
         for k in new_keys:
-            y, m, c = details[k]
-            lines.append(f"• {y}년 {m}월 {c['day']}일(토)  [표시: {c['text']}]")
-            lines.append(f"  👉 {month_url(y, m)}")
+            c = details[k]
+            d = c["date"]
+            pin = "📌 " if c["target"] else ""
+            lines.append(f"• {pin}{date_name(d)}  [표시: {c['text']}]")
+            lines.append(f"  👉 {month_url(d.year, d.month)}")
         lines.append("\n얼른 들어가서 예약하세요!")
         send_telegram("\n".join(lines))
     else:
-        print("새로 생긴 토요일 빈자리 없음. 지금 가능한 날:", available_now or "없음")
+        print("새로 생긴 빈자리 없음. 지금 가능한 날:", available_now or "없음")
 
     # 지금 가능한 날만 기억 → 사라졌다가 다시 뜨면 또 알려줌
     state["notified"] = available_now
@@ -328,7 +378,7 @@ def main():
     # 시작 알림 / 한 달에 한 번 '살아있어요' 알림
     last = state.get("last_heartbeat")
     if first_run:
-        send_telegram("✅ 캠핑장 토요일 빈자리 감시를 시작했어요! (약 5분마다 확인)")
+        send_telegram("✅ 캠핑장 빈자리 감시를 시작했어요! (약 5분마다 확인)")
         state["last_heartbeat"] = today.isoformat()
     elif not last or (today - dt.date.fromisoformat(last)).days >= HEARTBEAT_DAYS:
         send_telegram("🙂 캠핑장 빈자리 감시, 아직 잘 돌아가고 있어요.")
