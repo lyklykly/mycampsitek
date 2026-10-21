@@ -1,12 +1,14 @@
 name: 캠핑장 토요일 빈자리 알리미
 
 on:
+  # GitHub가 허락하는 가장 짧은 간격이 5분이라, 15분마다 '실행을 새로 켠다'.
+  # 켜진 실행 하나가 20분 동안 90초마다 계속 확인하므로 끊김 없이 이어진다.
   schedule:
-    - cron: "*/5 * * * *"      # 5분마다 (GitHub 사정에 따라 조금 늦어질 수 있음)
-  workflow_dispatch:           # 내가 직접 버튼 눌러 실행하기
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
     inputs:
       test:
-        description: "테스트 모드 (지금 토요일 칸 상태를 텔레그램으로 보내기)"
+        description: "테스트 모드 (지금 달력 상태를 한 번만 텔레그램으로 보내기)"
         type: boolean
         default: false
 
@@ -15,13 +17,13 @@ permissions:
   actions: write               # 차단되면 자동 실행을 스스로 끄기용
 
 concurrency:
-  group: camping-monitor
-  cancel-in-progress: false
+  group: camping-monitor       # 같은 시간에 두 개가 겹쳐 돌지 않게
+  cancel-in-progress: false    # 돌고 있는 것을 끊지 않고, 끝나면 다음 것이 이어받게
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 28
     steps:
       - name: 코드 가져오기
         uses: actions/checkout@v5
@@ -36,18 +38,23 @@ jobs:
           pip install playwright requests
           python -m playwright install --with-deps chromium
 
-      - name: 토요일 빈자리 확인
+      - name: 빈자리 확인 (20분 동안 90초마다)
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TEST_MODE: ${{ inputs.test }}
           TARGET_DATES: ${{ vars.TARGET_DATES }}
+          # 아래 두 개는 Settings > Secrets and variables > Actions > Variables 에서
+          # INTERVAL_SECONDS / LOOP_MINUTES 를 만들면 그 값으로 바뀐다.
+          INTERVAL_SECONDS: ${{ vars.INTERVAL_SECONDS || '90' }}
+          LOOP_MINUTES: ${{ vars.LOOP_MINUTES || '20' }}
           WORKFLOW_FILE: monitor.yml
         run: python monitor.py
 
       - name: 기억 파일 저장
         if: always()
+        continue-on-error: true      # 저장 실패해도 알림 기능은 계속
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -56,7 +63,12 @@ jobs:
             echo "바뀐 내용 없음"
           else
             git commit -m "상태 업데이트"
-            git push
+            for i in 1 2 3; do
+              git pull --rebase --autostash && git push && exit 0
+              echo "밀어넣기 재시도 $i"
+              sleep 5
+            done
+            echo "state.json 저장 실패(무시하고 계속)"
           fi
 
       - name: 문제 확인용 화면 저장
@@ -67,3 +79,17 @@ jobs:
           path: debug/
           if-no-files-found: ignore
           retention-days: 3
+
+      # 위 단계 중 하나라도 터지면(설치 실패 등) 조용히 죽지 않도록 알림
+      - name: 실패 알림
+        if: failure()
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT="⚠️ 캠핑장 알리미 실행이 실패했어요.
+          빈자리 확인을 못 했어요. 아래 주소에서 빨간 글씨를 확인해 주세요.
+          $RUN_URL"
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$TEXT" \
+            --data-urlencode "disable_web_page_preview=true" > /dev/null || true
