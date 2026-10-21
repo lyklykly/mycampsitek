@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 import re
+import sys
 from zoneinfo import ZoneInfo
 
 import requests
@@ -122,12 +123,16 @@ def save_state(state):
 
 
 def send_telegram(text):
+    """보냈으면 (True, ''), 못 보냈으면 (False, 이유)"""
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     print("----- 텔레그램 메시지 -----\n" + text + "\n--------------------------")
     if not token or not chat_id:
-        print("[경고] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 가 없어서 보내지 못했어요.")
-        return False
+        missing = " / ".join(n for n, v in [("TELEGRAM_TOKEN", token),
+                                            ("TELEGRAM_CHAT_ID", chat_id)] if not v)
+        reason = f"{missing} 이(가) 비어 있어요 (Secrets 이름을 확인하세요)"
+        print("[경고]", reason)
+        return False, reason
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -135,12 +140,18 @@ def send_telegram(text):
                   "disable_web_page_preview": True},
             timeout=20,
         )
-        if not r.ok:
-            print("텔레그램 전송 실패:", r.status_code, r.text[:300])
-        return r.ok
+        if r.ok:
+            return True, ""
+        hint = {401: "토큰이 틀렸어요 (TELEGRAM_TOKEN 확인)",
+                400: "chat_id 가 틀렸거나 봇에게 먼저 말을 걸지 않았어요",
+                403: "봇이 차단되었어요 (텔레그램에서 봇 대화방을 열고 시작을 누르세요)"}
+        reason = f"텔레그램 거절 {r.status_code} — {hint.get(r.status_code, '')} {r.text[:200]}"
+        print("[경고]", reason)
+        return False, reason
     except requests.RequestException as e:
-        print("텔레그램 전송 오류:", e)
-        return False
+        reason = f"텔레그램에 연결하지 못했어요: {e}"
+        print("[경고]", reason)
+        return False, reason
 
 
 def disable_workflow():
@@ -387,6 +398,16 @@ def main():
     print(f"오늘: {today} | 지정 날짜: {sorted(d.isoformat() for d in targets) or '없음'}")
     print(f"확인 간격: {interval}초 | 이번 실행이 도는 시간: {loop_minutes}분")
 
+    # 0) 텔레그램부터 점검한다. 여기서 막히면 뒤를 해봐야 소용없다.
+    ok, why = send_telegram("🧪 테스트를 시작했어요. 달력을 읽는 중이에요…" if test_mode
+                            else "🔌 알리미가 켜졌어요.")
+    if not ok:
+        print("\n[치명적] 텔레그램으로 보낼 수 없어서 여기서 멈춥니다.")
+        print("         이유:", why)
+        sys.exit(1)
+    if test_mode:
+        print("[확인] 텔레그램 연결 정상")
+
     state = load_state()
     first_run = not state
     state.setdefault("notified", [])
@@ -422,11 +443,20 @@ def main():
                     save_debug(page, "blocked")
                     stop_monitoring(state, str(e))
                     save_state(state)
+                    if test_mode:
+                        sys.exit(1)
                     return
                 except Exception as e:
                     state["fail_count"] += 1
                     print(f"[오류] {e}  (연속 {state['fail_count']}회)")
                     save_debug(page, "error")
+                    if test_mode:
+                        send_telegram("❌ 테스트 실패 — 달력을 읽지 못했어요\n\n"
+                                      f"이유: {e}\n\n"
+                                      "Actions 화면의 debug-screenshots 를 받아서 "
+                                      "로봇이 본 화면을 확인해 주세요.")
+                        save_state(state)
+                        sys.exit(1)
                     if state["fail_count"] >= MAX_FAILS:
                         stop_monitoring(state, f"{MAX_FAILS}번 연속 조회 실패 — 마지막 오류: {e}")
                         save_state(state)
