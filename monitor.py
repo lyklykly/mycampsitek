@@ -26,6 +26,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 BASE_URL = ("https://yeyak.syf.or.kr/www/88?company_code=SYF09&part_code=02"
             "&place_code=2&days=1&date_yyyymm={yyyymm}")
 MONTHS_TO_CHECK = 2            # 2 = 이번 달 + 다음 달
+MAX_NEXT_CLICKS = 3            # 달이 안 맞을 때 '다음월'을 최대 몇 번 눌러볼지
 DEFAULT_INTERVAL = 90          # 몇 초마다 다시 볼지 (GitHub 변수 INTERVAL_SECONDS 로 바꿀 수 있음)
 DEFAULT_LOOP_MINUTES = 20      # 한 번 켜진 실행이 몇 분 동안 반복할지
 FULL_WORDS = ["예약완료", "마감", "불가", "만실", "종료", "휴관", "휴무", "대기", "신청불가"]
@@ -72,14 +73,29 @@ JS_CALENDAR = """
       };
     })
   }));
-  // 달력 위쪽 어딘가에 적힌 '2026.10' 또는 '2026년 10월' 을 찾는다
-  const body = document.body.innerText || '';
-  let ym = body.match(/(20\\d\\d)\\s*[.\\-\\/]\\s*(\\d{1,2})/) ||
-           body.match(/(20\\d\\d)\\s*년\\s*(\\d{1,2})\\s*월/);
+  // 달력 표 가까운 곳부터, '2026.10' / '2026년 10월' 처럼 그 자체로 달을 뜻하는 글자만 모은다.
+  // (오늘 날짜 '2026.10.21' 같은 건 날짜까지 있으니 거르고, '이전월/다음월' 꼬리표도 순서로 밀린다)
+  const ONLY_MONTH = /^(20\\d\\d)\\s*[.\\-\\/년]\\s*(\\d{1,2})\\s*월?$/;
+  const labels = [];
+  const scan = root => {
+    for (const el of root.querySelectorAll('*')) {
+      if (el.children.length) continue;                 // 글자만 든 칸만 본다
+      const t = (el.innerText || '').trim();
+      const m2 = t.match(ONLY_MONTH);
+      if (m2) labels.push([+m2[1], +m2[2]]);
+    }
+  };
+  let scope = t.parentElement;                          // 달력 표 주변부터 넓혀가며 찾는다
+  for (let i = 0; i < 4 && scope; i++, scope = scope.parentElement) {
+    scan(scope);
+    if (labels.length) break;
+  }
+  if (!labels.length) scan(document);
   return {
     ok: true,
-    year: ym ? +ym[1] : null,
-    month: ym ? +ym[2] : null,
+    year: labels.length ? labels[0][0] : null,
+    month: labels.length ? labels[0][1] : null,
+    labels: labels.slice(0, 6),
     rows: rows
   };
 }
@@ -99,6 +115,21 @@ JS_READY = """
       return rows.slice(1).some(r => r.cells.length === 7);
   }
   return false;
+}
+"""
+
+
+# '다음월' 버튼을 찾아 누르는 코드
+JS_NEXT_MONTH = """
+() => {
+  const norm = s => (s || '').replace(/\\s+/g, '');
+  const byId = document.querySelector('#next_month, .next_month, [id*=next], [class*=next]');
+  if (byId) { byId.click(); return 'id:' + (byId.id || byId.className); }
+  for (const el of document.querySelectorAll('a,button,span,div,li')) {
+    const t = norm(el.innerText || el.title || el.getAttribute('alt'));
+    if (t === '다음월' || t === '다음달' || t === '다음') { el.click(); return 'text:' + t; }
+  }
+  return null;
 }
 """
 
@@ -242,6 +273,24 @@ def classify(cell):
     return "closed", text
 
 
+def layout_matches(rows, y, m):
+    """달력에 찍힌 날짜 숫자 배치가 그 해 그 달과 맞는지 확인한다 (글자 표시보다 믿을 만함)."""
+    weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(y, m)
+    week_rows = [r for r in rows if r.get("n") == 7]
+    if len(week_rows) < len(weeks):
+        return False
+    checked = 0
+    for i, w in enumerate(weeks):
+        for col, day in enumerate(w):
+            if day == 0:
+                continue
+            got = re.search(r"\d+", week_rows[i]["cells"][col].get("text") or "")
+            if not got or int(got.group()) != day:
+                return False
+            checked += 1
+    return checked >= 20          # 한 달치 숫자가 충분히 맞아떨어져야 통과
+
+
 def interpret(cal, y, m, today, targets):
     """달력 칸 → [{date, status, text, target, cls, html}] (토요일 전부 + 지정 날짜)"""
     weeks = calendar.Calendar(firstweekday=6).monthdayscalendar(y, m)
@@ -306,10 +355,32 @@ def check_month(page, blocked_hits, y, m, today, targets, keep_screenshot=False)
     if not cal.get("ok") or not any(r.get("n") == 7 for r in cal.get("rows", [])):
         save_debug(page, f"no_calendar_{y}{m:02d}")
         raise RuntimeError(f"{label} 달력 표를 찾지 못했어요 (사이트 모양이 바뀌었을 수 있음)")
-    if (cal.get("year"), cal.get("month")) != (y, m):
-        save_debug(page, f"wrong_month_{y}{m:02d}")
-        raise RuntimeError(f"{label} 달력을 열었는데 화면은 "
-                           f"{cal.get('year')}.{cal.get('month')} 이에요")
+    # 화면에 적힌 달 표시는 틀릴 수 있어서(오늘 날짜 '2026.10.21', 이전월 꼬리표 등),
+    # 달력에 찍힌 날짜 숫자 배치로 진짜 몇 월인지 확인한다.
+    if not layout_matches(cal.get("rows", []), y, m):
+        # 주소만으로 달이 안 바뀌는 사이트일 수 있으니 '다음월'을 눌러 맞춰본다
+        for tries in range(1, MAX_NEXT_CLICKS + 1):
+            moved = page.evaluate(JS_NEXT_MONTH)
+            if not moved:
+                break
+            print(f"[이동] '다음월' 누름 ({tries}번째, {moved})")
+            page.wait_for_timeout(2500)
+            cal = page.evaluate(JS_CALENDAR)
+            if cal.get("ok") and layout_matches(cal.get("rows", []), y, m):
+                print(f"[이동] {label} 달력에 도착했어요.")
+                break
+        else:
+            moved = None
+        if not layout_matches(cal.get("rows", []), y, m):
+            save_debug(page, f"wrong_month_{y}{m:02d}")
+            seen = cal.get("labels") or []
+            raise RuntimeError(
+                f"{label} 달력을 열지 못했어요 "
+                f"(화면에서 읽은 달 표시: {seen or '없음'}"
+                f"{', 다음월 버튼도 못 찾음' if not moved else ''})")
+    elif (cal.get("year"), cal.get("month")) != (y, m):
+        print(f"[참고] 화면의 달 표시는 {cal.get('year')}.{cal.get('month')} 이지만, "
+              f"날짜 배치는 {label} 이 맞아서 그대로 진행해요.")
 
     if keep_screenshot:
         save_debug(page, f"calendar_{y}{m:02d}")
@@ -319,6 +390,9 @@ def check_month(page, blocked_hits, y, m, today, targets, keep_screenshot=False)
 # ---------------------------- 한 바퀴 확인 ----------------------------
 def one_cycle(page, state, today, targets, bad_dates, test_mode):
     """달력을 한 번 훑고 필요하면 알림을 보낸다. 사이트가 막으면 Blocked 를 던진다."""
+    # 한 실행이 자정을 넘길 수 있으니, 매번 '오늘'을 기준으로 지난 지정 날짜를 걷어낸다
+    targets = {d for d in targets if d >= today}
+
     blocked_hits = []
     handler = (lambda r: blocked_hits.append((r.status, r.url))
                if "syf.or.kr" in r.url and r.status in BLOCK_STATUS else None)
