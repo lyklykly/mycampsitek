@@ -185,6 +185,25 @@ def send_telegram(text):
         return False, reason
 
 
+def telegram_ping():
+    """메시지를 보내지 않고 토큰/대화방만 확인한다. (조용한 점검)"""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        missing = " / ".join(n for n, v in [("TELEGRAM_TOKEN", token),
+                                            ("TELEGRAM_CHAT_ID", chat_id)] if not v)
+        return False, f"{missing} 이(가) 비어 있어요 (Secrets 이름을 확인하세요)"
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=20)
+        if r.ok:
+            return True, ""
+        if r.status_code == 401:
+            return False, "토큰이 틀렸어요 (TELEGRAM_TOKEN 확인)"
+        return False, f"텔레그램 거절 {r.status_code} {r.text[:200]}"
+    except requests.RequestException as e:
+        return False, f"텔레그램에 연결하지 못했어요: {e}"
+
+
 def disable_workflow():
     """GitHub 자동 실행(5분마다)을 스스로 끈다."""
     token = os.environ.get("GITHUB_TOKEN")
@@ -208,6 +227,7 @@ def disable_workflow():
 
 def stop_monitoring(state, reason):
     state["stopped"] = True
+    state["stopped_reason"] = reason
     turned_off = disable_workflow()
     send_telegram(
         "⛔ 캠핑장 빈자리 조회를 멈췄어요\n\n"
@@ -435,27 +455,45 @@ def one_cycle(page, state, today, targets, bad_dates, test_mode):
         send_telegram("\n".join(lines))
         return
 
-    available_now, details = [], {}
+    available_now, details, status_now = [], {}, {}
     for cells in results.values():
         for c in cells:
+            key = c["date"].isoformat()
+            status_now[key] = c["status"]
+            details[key] = c
             if c["status"] == "available":
-                key = c["date"].isoformat()
                 available_now.append(key)
-                details[key] = c
 
+    before = state.get("last_status", {})
+
+    # (가) 누를 수 있게 살아난 날
     new_keys = [k for k in available_now if k not in state["notified"]]
-    if new_keys:
+
+    # (나) 안전장치: '예약완료'였다가 그 글자가 사라진 날 = 취소가 난 것일 수 있다.
+    #     사이트가 빈자리를 링크로 안 만들어 주는 경우에도 이걸로 잡아낸다.
+    freed = [k for k, st in status_now.items()
+             if before.get(k) == "full" and st != "full" and k not in new_keys]
+
+    if new_keys or freed:
         lines = ["🏕️ 캠핑장 빈자리가 떴어요!\n"]
         for k in new_keys:
             c = details[k]
             lines.append(f"• {'📌 ' if c['target'] else ''}{date_name(c['date'])}  [표시: {c['text']}]")
             lines.append(f"  👉 {month_url(c['date'].year, c['date'].month)}")
+        for k in freed:
+            c = details[k]
+            lines.append(f"• {'📌 ' if c['target'] else ''}{date_name(c['date'])} "
+                         f"— '예약완료'가 풀렸어요  [표시: {c['text']}]")
+            lines.append(f"  👉 {month_url(c['date'].year, c['date'].month)}")
         lines.append("\n얼른 들어가서 예약하세요!")
         send_telegram("\n".join(lines))
     else:
-        print("새로 생긴 빈자리 없음. 지금 가능한 날:", available_now or "없음")
+        print("새로 생긴 빈자리 없음. 지금 상태:",
+              ", ".join(f"{k}:{v}" for k, v in sorted(status_now.items())) or "없음")
 
     state["notified"] = available_now
+    state["last_status"] = status_now
+    state["last_check"] = dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ---------------------------- 메인 ----------------------------
@@ -472,28 +510,44 @@ def main():
     print(f"오늘: {today} | 지정 날짜: {sorted(d.isoformat() for d in targets) or '없음'}")
     print(f"확인 간격: {interval}초 | 이번 실행이 도는 시간: {loop_minutes}분")
 
-    # 0) 텔레그램부터 점검한다. 여기서 막히면 뒤를 해봐야 소용없다.
-    ok, why = send_telegram("🧪 테스트를 시작했어요. 달력을 읽는 중이에요…" if test_mode
-                            else "🔌 알리미가 켜졌어요.")
-    if not ok:
-        print("\n[치명적] 텔레그램으로 보낼 수 없어서 여기서 멈춥니다.")
-        print("         이유:", why)
-        sys.exit(1)
-    if test_mode:
-        print("[확인] 텔레그램 연결 정상")
-
+    # 0) 먼저 기억을 읽는다. 멈춤 상태면 텔레그램을 건드리기 전에 끝낸다.
     state = load_state()
     first_run = not state
     state.setdefault("notified", [])
     state.setdefault("fail_count", 0)
+    state.setdefault("last_status", {})
 
     if state.get("stopped"):
         if not manual:
             print("멈춤 상태라서 조회하지 않고 끝냅니다.")
+            print("다시 켜려면: Actions → Enable workflow → Run workflow")
+            # 멈춰 있다는 사실은 하루에 한 번만 알린다 (매번 보내면 스팸이 된다)
+            last_warn = state.get("stopped_warned")
+            if last_warn != today.isoformat():
+                send_telegram(
+                    "⛔ 캠핑장 알리미가 멈춰 있어요 (하루 한 번 알림)\n\n"
+                    f"멈춘 이유: {state.get('stopped_reason', '기록 없음')}\n\n"
+                    "지금은 빈자리를 보고 있지 않아요.\n"
+                    "다시 켜려면 GitHub → Actions → 알리미 선택 → "
+                    "Enable workflow를 누른 뒤 Run workflow를 한 번 눌러주세요.")
+                state["stopped_warned"] = today.isoformat()
+                save_state(state)
             return
         state["stopped"] = False
         state["fail_count"] = 0
+        state.pop("stopped_warned", None)
+        state.pop("stopped_reason", None)
         send_telegram("▶️ 수동 실행으로 캠핑장 빈자리 감시를 다시 시작해요.")
+
+    # 1) 메시지를 보내지 않고 텔레그램 연결만 조용히 확인한다
+    ok, why = telegram_ping()
+    if not ok:
+        print("\n[치명적] 텔레그램으로 보낼 수 없어서 여기서 멈춥니다.")
+        print("         이유:", why)
+        sys.exit(1)
+    print("[확인] 텔레그램 연결 정상")
+    if test_mode:
+        send_telegram("🧪 테스트를 시작했어요. 달력을 읽는 중이에요…")
 
     if first_run and not test_mode:
         send_telegram(f"✅ 캠핑장 빈자리 감시를 시작했어요! (약 {interval}초마다 확인)")
@@ -546,7 +600,12 @@ def main():
                 last = state.get("last_heartbeat")
                 if not test_mode and last and \
                         (dt.date.today() - dt.date.fromisoformat(last)).days >= HEARTBEAT_DAYS:
-                    send_telegram("🙂 캠핑장 빈자리 감시, 아직 잘 돌아가고 있어요.")
+                    cur = state.get("last_status", {})
+                    marks = {"available": "✅", "full": "❌", "closed": "🔒", "empty": "⬜"}
+                    detail = "\n".join(f"  {k} {marks.get(v, v)}"
+                                        for k, v in sorted(cur.items())) or "  (없음)"
+                    send_telegram("🙂 캠핑장 빈자리 감시, 아직 잘 돌아가고 있어요.\n\n"
+                                  "지금 보고 있는 날짜 상태:\n" + detail)
                     state["last_heartbeat"] = dt.date.today().isoformat()
 
                 save_state(state)
