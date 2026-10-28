@@ -1,5 +1,14 @@
 {
   "notified": [],
   "fail_count": 0,
-  "last_heartbeat": "2026-10-10"
+  "last_heartbeat": "2026-10-10",
+  "last_status": {
+    "2026-10-31": "full",
+    "2026-11-07": "full",
+    "2026-11-14": "full",
+    "2026-11-21": "full",
+    "2026-11-27": "full",
+    "2026-11-28": "full"
+  },
+  "last_check": "2026-10-29 01:37:26"
 }
