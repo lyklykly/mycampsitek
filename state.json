@@ -1,15 +1,12 @@
 {
-  "notified": [
-    "2026-11-28"
-  ],
+  "notified": [],
   "fail_count": 0,
   "last_heartbeat": "2026-11-09",
   "last_status": {
-    "2026-11-28": "available",
     "2026-12-05": "full",
     "2026-12-12": "full",
     "2026-12-19": "full",
     "2026-12-26": "full"
   },
-  "last_check": "2026-11-28 18:21:16"
+  "last_check": "2026-11-29 03:00:07"
 }
